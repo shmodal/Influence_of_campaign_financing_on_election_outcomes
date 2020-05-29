@@ -5,7 +5,9 @@ candidates - to forecast election outcomes for congressional candidates. A PAC i
 campaign contributions from members and donates those funds to campaigns for or against candidates, ballot initiatives, or legislation.
 
 
-We obtained our data from the [Center for Responsive Politics](www.opensecrets.org), which is a non-profit, non-partisan research group based in Washington, D.C. 
+We obtained our data from the 
+[Center for Responsive Politics](http://www.opensecrets.org),
+which is a non-profit, non-partisan research group based in Washington, D.C. 
 It tracks the effects of money and lobbying on elections and public policy. We used data from the past three cycles: 2018, 2016, and 2014.
 
 
