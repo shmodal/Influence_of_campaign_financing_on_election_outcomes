@@ -5,5 +5,7 @@
 *.rds   binary
 *.Rd    text
 *.Rdx   binary
-*.Rmd	text
+*.Rmd linguist-detectable=false
 *.R  	text
+
+*.html linguist-detectable=false
