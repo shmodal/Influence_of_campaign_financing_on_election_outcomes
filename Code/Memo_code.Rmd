@@ -1,0 +1,923 @@
+---
+title: "DPI 610 Final Project Memo"
+author: "Leirong (Leia) Feng & Sofiane Nour Hadji"
+date: "4/27/2020"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+sub-title: Influence of Campaign Financing on Election Outcomes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r Libraries, message=FALSE, warning=FALSE}
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(caTools)
+library(glmnet)
+library(pROC)
+library(ROCR)
+library(Matching)
+library(tableone)
+library(cobalt)
+library(rpart)
+library(rpart.plot)
+library(dplyr)
+```
+
+## Table of Contents
+
+1. Problem
+2. Data Source
+3. Data Preprocessing
+4. Exploratory Data Analysis (EDA)
+5. Model Training & Validation
+6. Results & Extensions
+
+## Problem
+
+We aim to use campaign financing data - specifically, direct contribution amounts from _Political Action Committees (PACs)_ to candidates - to forecast election outcomes for congressional candidates. A PAC is an organization that pools campaign contributions from members and donates those funds to campaigns for or against candidates, ballot initiatives, or legislation.
+
+## Data Source
+
+We obtained our data from the _Center for Responsive Politics_, which is a non-profit, non-partisan research group based in Washington, D.C. It tracks the effects of money and lobbying on elections and public policy, and maintains a public online database of its information at www.opensecrets.org.
+
+The campaign finance data for every election cycle includes five tables: individual contributions, candidates, FEC committees, PAC to canddiates, and PAC to PACs. For the purposes of our study, we focused mainly on the __candidates__ and __PAC to candidates__ tables. We used data from the past three cycles: 2018, 2016, and 2014. We also used reference data (CRP categories) to obtain the PAC industry codes. Finally, the Open Data User's Guide provided data dictionaries for all the tables.
+
+Out data can be downloaded here: 
+https://drive.google.com/open?id=1HkTuv2nSX-kCCItt2aHsGwqwcoiKHrlr
+
+## Data Cleaning
+
+```{r Clean PAC, eval=FALSE}
+pacs <- read.delim("pacs18.txt",header=FALSE,sep=",")
+
+for (i in 1:4){
+  pacs[,i] <- gsub('^.|.$', '', pacs[,i])
+}
+
+for (i in 7:10){
+  pacs[,i] <- gsub('^.|.$', '', pacs[,i])
+}
+
+pacs <- pacs %>%
+  rename(
+    Cycle = V1,
+    FECRecNo = V2,
+    PACID = V3,
+    CID = V4,
+    Amount = V5,
+    Date = V6,
+    RealCode = V7,
+    Type = V8,
+    DI = V9,
+    FECCandID = V10
+  )
+
+write_csv(pacs, "pacs18.csv")
+```
+
+```{r Read Multiseparator}
+read.multisep <- function(File,sep) {
+    Lines <- readLines(File)
+    Matrix <- do.call(rbind,strsplit(Lines, sep, fixed = TRUE))
+    DataFrame <- structure(data.frame(Matrix))
+    DataFrame[] <- lapply(DataFrame, type.convert)
+    DataFrame
+}
+```
+
+```{r Clean Candidate, eval=FALSE}
+cands <- read.multisep("cands18.txt",sep="|,|")
+
+cands[,1] <- sub('.','', cands[,1])
+cands[,12] <- gsub('.{1}$','', cands[,12])
+
+cands <- cands %>%
+  rename(
+    Cycle = X1,
+    FECCandID = X2,
+    CID = X3,
+    FirstLastP = X4,
+    Party = X5,
+    DistIDRunFor = X6,
+    DistIDCurr = X7,
+    CurrCand = X8,
+    CycleCand = X9,
+    CRPICO = X10,
+    RecipCode = X11,
+    NoPacs = X12
+  )
+
+write_csv(cands, "cands18.csv")
+```
+
+We also applied the same cleaning steps to the 2014 and 2016 data tables.
+
+## Exploratory Data Analysis (EDA)
+
+We then performed some EDA to better understand our dataset. In order to clean the data, we used the RecipCode column, which comprises of two characters that indicate the _Party_ and _Status_ of candidates. The abbreviations are as follows:  
+- Party: __D__ for Democratic, __R__ for Republican, __I__ for Independent, __L__ for Libertarian, __3__ for third party, __U__ for unknown  
+- Status: __W__ for Winner, __L__ for Loser, __I__ for Incumbent, __C__ for
+Challenger, __O__ for Open Seat, __N__ for Non-Incumbent  
+Note: __N__ is reserved for candidates that are neither in office nor running
+during the cycle in question.
+
+We used R's dplyr package to clean the data prior to visualization. This included operations such as filtering out missing or mislabeled data, removing rows with RecipCodes ending with I, C, O, or N, and removing rows with NA values in contribution amount when calculating the total or average contribution.
+
+```{r}
+cands <- read.csv("cands18.csv",header=TRUE)
+pacs <- read.csv("pacs18.csv",header=TRUE)
+```
+
+The first plot shows the election outcome of the candidates according to their party. Democrats and Republicans make up a roughly equal proportion of Winners, with Democrats having a slight advantage.
+
+```{r Plot 1: Election Outcome by Party}
+for (i in which(cands$RecipCode == "3l")) {
+  cands$RecipCode[i] <- "3L"
+}
+
+CandsOutcome <- cands %>%
+  select(Party,RecipCode) %>%
+  filter(str_sub(RecipCode,2,2)!="I") %>%
+  filter(str_sub(RecipCode,2,2)!="C") %>%
+  filter(str_sub(RecipCode,2,2)!="N") %>%
+  filter(str_sub(RecipCode,2,2)!="O") %>%
+  mutate(Outcome=str_sub(RecipCode,2,2)) %>%
+  group_by(Party,Outcome) %>%
+  summarise(NumCandidates=n())
+
+ggplot(CandsOutcome,
+       aes(x=Outcome,y=NumCandidates,fill=Party))+
+  geom_bar(stat="identity",width=0.5)+
+  scale_fill_manual("Party", values = c("3" = "#7CAE00",
+                                        "D" = "#00BFC4",
+                                        "R" = "#F8766D",
+                                        "L" = "#BB9D00",
+                                        "I" = "#E76BF3"))+
+  xlab("Outcome")
+```
+
+The second plot shows the election outcome of the candidates according to their status. Incumbents made up the vast majority of Winners, while Challengers were the majority among Losers.
+
+```{r Plot 2: Election Outcome by Status}
+for (i in which(cands$RecipCode == "3l")) {
+  cands$RecipCode[i] <- "3L"
+}
+
+CandsOutcome <- cands %>%
+  select(CRPICO,RecipCode) %>%
+  filter(str_sub(RecipCode,2,2)!="I") %>%
+  filter(str_sub(RecipCode,2,2)!="C") %>%
+  filter(str_sub(RecipCode,2,2)!="N") %>%
+  filter(str_sub(RecipCode,2,2)!="O") %>%
+  filter(CRPICO!=" ") %>%
+  mutate(Outcome=str_sub(RecipCode,2,2)) %>%
+  group_by(CRPICO,Outcome) %>%
+  summarise(NumCandidates=n())
+
+ggplot(CandsOutcome,
+       aes(x=Outcome,y=NumCandidates,fill=CRPICO))+
+  geom_bar(stat="identity",width=0.5)+
+  scale_fill_manual("CRPICO", values = c("C" = "#7CAE00",
+                                        "I" = "#00BFC4",
+                                        "O" = "#F8766D"))+
+  xlab("Outcome")
+```
+
+The third plot gives the total PAC contribution amounts by party. On the whole, Democrat and Republican Winners received roughly the same amount, while Republican Losers received more than Democrat Losers. Winners received more in total than Losers.
+
+```{r Plot 3: Total PAC Contribution by Party,warning=FALSE}
+pacContribution <- pacs %>%
+  select(CID,Amount,DI) %>%
+  filter(DI=="D") %>%
+  group_by(CID) %>%
+  summarise(Contribution = sum(Amount))
+
+PACtoCand <- left_join(cands,pacContribution,by="CID")
+
+# Plot 2
+PACtoCandidate <- PACtoCand %>%
+  select(Party,RecipCode,Contribution) %>%
+  filter(!is.na(Contribution)) %>%
+  filter(str_sub(RecipCode,2,2)!="I") %>%
+  filter(str_sub(RecipCode,2,2)!="C") %>%
+  filter(str_sub(RecipCode,2,2)!="N") %>%
+  filter(str_sub(RecipCode,2,2)!="O") %>%
+  mutate(Outcome=str_sub(RecipCode,2,2)) %>%
+  group_by(Outcome,Party) %>%
+  summarise(Contribution=sum(Contribution))
+
+ggplot(PACtoCandidate,
+       aes(x=Outcome,y=Contribution/1000000,fill=Party))+
+  geom_bar(stat="identity",width=0.5)+
+  scale_fill_manual("Party", values = c("3" = "#7CAE00",
+                                        "D" = "#00BFC4",
+                                        "R" = "#F8766D",
+                                        "L" = "#BB9D00",
+                                        "I" = "#E76BF3")) +
+  ylab("Total Amount ($ in millions)")
+```
+
+The fourth plot gives the average PAC contribution amounts by party. On average, Republicans received the most contributions, followed by Democrats, then by Independents. Winners received more on average than Losers.
+
+```{r Plot 4: Average PAC Contribution by Party}
+PACtoCandidate <- PACtoCand %>%
+  select(Party,RecipCode,Contribution) %>%
+  filter(!is.na(Contribution)) %>%
+  filter(str_sub(RecipCode,2,2)!="I") %>%
+  filter(str_sub(RecipCode,2,2)!="C") %>%
+  filter(str_sub(RecipCode,2,2)!="N") %>%
+  filter(str_sub(RecipCode,2,2)!="O") %>%
+  mutate(Outcome=str_sub(RecipCode,2,2)) %>%
+  group_by(Outcome,Party) %>%
+  summarise(AvgAmount=mean(Contribution)) %>%
+  mutate(PartyOutcome=paste(Party,Outcome,sep=""))
+
+ggplot(PACtoCandidate,
+       aes(x=PartyOutcome,y=AvgAmount/1000,fill=Party))+
+  geom_bar(stat="identity",width=0.75)+
+  scale_fill_manual("Party", values = c("3" = "#7CAE00",
+                                        "D" = "#00BFC4",
+                                        "R" = "#F8766D",
+                                        "L" = "#BB9D00",
+                                        "I" = "#E76BF3")) +
+  ylab("Average Amount ($ in thousands)")
+```
+
+The fifth plot gives the total PAC contribution amounts by status. On the whole, Incumbents received the most among both Winners and Losers. Winners received more in total than Losers.
+
+```{r Plot 5: Total PAC Contribution by Status}
+PACtoCandidate <- PACtoCand %>%
+  select(CRPICO,RecipCode,Contribution) %>%
+  filter(CRPICO!=" ") %>%
+  filter(!is.na(Contribution)) %>%
+  filter(str_sub(RecipCode,2,2)!="I") %>%
+  filter(str_sub(RecipCode,2,2)!="C") %>%
+  filter(str_sub(RecipCode,2,2)!="N") %>%
+  filter(str_sub(RecipCode,2,2)!="O") %>%
+  mutate(Outcome=str_sub(RecipCode,2,2)) %>%
+  group_by(Outcome,CRPICO)
+
+ggplot(PACtoCandidate,
+       aes(x=Outcome,y=Contribution/1000000,fill=CRPICO))+
+  geom_bar(stat="identity",width=0.5)+
+  scale_fill_manual("CRPICO", values = c("C" = "#7CAE00",
+                                         "I" = "#00BFC4",
+                                         "O" = "#F8766D")) +
+  ylab("Total Amount ($ in millions)")
+```
+
+The sixth plot gives the average PAC contribution amounts by status. On average, Incumbents received the most, followed by Challengers then Open Seats. It is interesting to note that Incumbent Losers received more than Incumbent Winners, whereas Winners received more than Losers in the cases of Challengers or Open Seats.
+
+```{r Plot 6: Average PAC Contribution by Status}
+PACtoCandidate <- PACtoCand %>%
+  select(CRPICO,RecipCode,Contribution) %>%
+  filter(CRPICO!=" ") %>%
+  filter(!is.na(Contribution)) %>%
+  filter(str_sub(RecipCode,2,2)!="I") %>%
+  filter(str_sub(RecipCode,2,2)!="C") %>%
+  filter(str_sub(RecipCode,2,2)!="N") %>%
+  filter(str_sub(RecipCode,2,2)!="O") %>%
+  mutate(Outcome=str_sub(RecipCode,2,2)) %>%
+  group_by(Outcome,CRPICO) %>%
+  summarise(AvgAmount=mean(Contribution)) %>%
+  mutate(CRPICOOutcome=paste(CRPICO,Outcome,sep=""))
+
+ggplot(PACtoCandidate,
+       aes(x=CRPICOOutcome,y=AvgAmount/1000,fill=CRPICO))+
+  geom_bar(stat="identity",width=0.5)+
+  scale_fill_manual("CRPICO", values = c("C" = "#7CAE00",
+                                         "I" = "#00BFC4",
+                                         "O" = "#F8766D")) +
+  ylab("Average Amount ($ in thousands)")
+```
+
+Further exploratory data analysis was conducted after the data processing and feature engineering.
+
+## Data Preprocessing
+
+We performed data preprocessing on the two data tables we used: Candidates and PAC to Candidates. 
+We first regrouped the PACs contributions files (of 2014,2016 and 2018), merging them with the industries table.It stores the codes corresponding to the industries types of the different PACs. 
+From the PAC tables of 2018, 2016, and 2014, we selected direct contributions, grouped them by candidate ID, PAC industry or timeframe before 2018 elections (i.e. 3 months, 6 months, or 12 months), summed total contributions to each candidate for the years 2014 and 2016, summed total contributions per industry to each candidate for the year 2018.
+
+We then performed a left join of the 2018 candidate table to the PAC contribution data from the three cycles. We further cleaned the data by mutating a new column "Outcome" to indicate the Winner __(1)__ or Loser __(0)__ in the election. We only kept contributions made before Election Day (i.e. November 6th, 2018), and we replaced all NA contributions with 0. We kept only distinct candidate IDs and removed duplicate rows. Finally, we also added the number of candidates per district as an indicator of the competitiveness of the race.
+
+
+
+
+```{r Merging PACs and industries}
+
+rm(pacs)
+
+industries=read.csv("CRP_Categories.csv" )
+colnames(industries)[1]="RealCode"
+
+pacs18 <- read.csv("pacs18.csv",header=TRUE)  %>% filter(DI=="D")
+pacs16 <- read.csv("pacs16.csv",header=TRUE )%>% filter(DI=="D")
+pacs14 <- read.csv("pacs14.csv",header=TRUE) %>% filter(DI=="D")
+
+
+pacs18$Date<- as.Date(pacs18$Date,format="%m/%d/%Y")
+pacs16$Date<- as.Date(pacs16$Date,format="%m/%d/%Y")
+pacs14$Date<- as.Date(pacs14$Date,format="%m/%d/%Y")
+pacs18 <- pacs18%>% filter(Date<="2018-11-6")
+pacs16 <- pacs16%>% filter(Date<="2016-11-8")
+pacs14 <- pacs14%>% filter(Date<="2014-11-4")
+
+pacs<- rbind(pacs18,pacs16,pacs14)
+
+#We only keep the key and the name of the sector
+pacs_and_industries <- merge(pacs,industries[,c(1,6)],by ="RealCode")
+
+columns_to_keep = c("Cycle","CID","Amount","Date","Sector.Long")
+pacs_and_industries<- pacs_and_industries[,columns_to_keep]
+
+```
+
+
+```{r Contributions by timeframe}
+timeline_contributions <- pacs_and_industries %>% group_by(CID) %>% filter(Cycle==2018) %>% select(Cycle,CID,Amount,Date) %>% 
+    mutate(
+          Amount_2018 = sum(Amount),
+          Three_M_Cont_2018=sum(Amount[Date>="2018-8-6"]),
+          Six_M_Cont_2018=sum(Amount[Date>="2018-5-6"]),
+          Twelve_M_Cont_2018=sum(Amount[Date>="2017-11-6"])
+    ) %>% select(CID,Amount_2018,Three_M_Cont_2018,Six_M_Cont_2018,Twelve_M_Cont_2018) %>% distinct(CID,.keep_all = TRUE)  %>%  ungroup()
+
+
+amount_2016 <- pacs_and_industries %>% filter(Cycle==2016) %>% group_by(CID) %>% select(Cycle,CID,Amount) %>% mutate(Amount_2016=sum(Amount)) %>% select(CID,Amount_2016) %>% distinct(CID,.keep_all = TRUE)  %>%  ungroup()
+
+amount_2014 <-pacs_and_industries %>% filter(Cycle==2014) %>% group_by(CID) %>% select(Cycle,CID,Amount) %>% mutate(Amount_2014=sum(Amount)) %>% select(CID,Amount_2014) %>% distinct(CID,.keep_all = TRUE)  %>%  ungroup()
+```
+
+```{r Competitiveness of race}
+number_candidates <-cands %>% filter(CurrCand=="Y") %>% 
+  group_by(DistIDRunFor) %>% summarise(
+  n_candidates_final=n() ) %>% ungroup() %>% as.data.frame()
+head(number_candidates)
+```
+
+
+```{r Contributions by industries}
+ind<- pacs_and_industries %>% group_by(CID) %>% filter(Cycle==2018) %>% 
+  
+  
+  mutate(Amount_Agribusiness_2018=sum(Amount[Sector.Long=="Agribusiness"]),
+        Amount_Candidate_2018=sum(Amount[Sector.Long=="Candidate"]),
+        Amount_Communications_Electronics_2018=sum(Amount[
+          Sector.Long=="Communications/Electronics"]),
+        Amount_Construction_2018=sum(Amount[
+          Sector.Long=="Construction"]),
+        Amount_Defense_2018=sum(Amount[
+          Sector.Long=="Defense"]),
+        Amount_Energy_Natural_Resources_2018=sum(Amount[
+          Sector.Long=="Energy & Natural Resources"]),
+        Amount_Finance_Insurance_Real_Estate_2018=sum(Amount[
+          Sector.Long=="Finance, Insurance & Real Estate"]),
+        Amount_Health_2018=sum(Amount[
+          Sector.Long=="Health"]),
+        Amount_Ideological_Single_Issue_2018=sum(Amount[
+          Sector.Long=="Ideological/Single-Issue"]),
+        Amount_Joint_Candidate_Cmtes_2018=sum(Amount[
+          Sector.Long=="Joint Candidate Cmtes"]),
+        Amount_Labor_2018=sum(Amount[
+          Sector.Long=="Labor"]),
+        Amount_Lawyers_Lobbyists_2018=sum(Amount[
+          Sector.Long=="Lawyers & Lobbyists"]),
+        Amount_Misc_Business_2018=sum(Amount[
+          Sector.Long=="Misc Business"]),
+        Amount_Non_contribution_2018=sum(Amount[
+          Sector.Long=="Non-contribution"]),
+        Amount_Other_2018=sum(Amount[
+          Sector.Long=="Other"]),
+        Amount_Party_Cmtes_2018=sum(Amount[
+          Sector.Long=="Party Cmtes"]),
+        Amount_Transportation_2018=sum(Amount[
+          Sector.Long=="Transportation"]),
+        Amount_Unknown_2018=sum(Amount[
+          Sector.Long=="Unknown"])
+
+                                      ) %>%
+
+  distinct(CID,.keep_all = TRUE)  %>%  ungroup()
+
+ind$Amount<- NULL
+ind$Date <- NULL
+ind$Sector.Long<- NULL
+head(ind)
+```
+
+
+```{r Merging data,warning=FALSE,message=FALSE}
+c<-left_join(cands,amount_2014,by="CID")
+c$CID<- as.factor(c$CID)
+
+c<- left_join(c,amount_2016,by="CID")
+c$CID<- as.factor(c$CID)
+
+
+c<- left_join(c,timeline_contributions,by="CID")
+c$CID<- as.factor(c$CID)
+
+
+c <- left_join(c,ind,by="CID")
+c$CID<- as.factor(c$CID)
+
+c <- left_join(c,number_candidates,by="DistIDRunFor")
+c$DistIDRunFor <- as.factor(c$DistIDRunFor)
+colnames(c)[1]<- "Cycle"
+```
+
+
+```{r NA contributions, Outcome and removing wrongly coded data}
+df <- c %>%
+  mutate(State = substr(DistIDRunFor,1,2)) %>%
+  mutate(Outcome = substr(RecipCode,2,2)) %>%
+  filter(Outcome != "I") %>%
+  filter(Outcome != "C") %>%
+  filter(Outcome != "O") %>%
+  filter(Outcome != "N")
+
+for (i in which(df$Outcome=="W")){
+  df$Outcome[i] <- 1
+}
+for (i in which(df$Outcome=="L")){
+  df$Outcome[i] <- 0
+}
+
+df$Cycle.y<- NULL
+
+
+df[,13:36][is.na(df[,13:36])]<- 0
+df$Outcome[df$Outcome=="l"]<- 1
+df$Outcome <- as.numeric(df$Outcome)
+
+df$CRPICO[df$CRPICO==" "]<- NA
+df<-df[!is.na(df$CRPICO),]
+
+df <- df %>%
+  distinct(CID,.keep_all=TRUE)
+
+
+df <- df[!is.na(df$n_candidates_final),]
+
+
+write.csv(df,"data.csv",row.names=F)
+```
+
+
+
+
+We can now complete our exploration of the data, leveraging the interaction between PACs industries and types of candidates.
+
+The seventh plot represents the number of PAC contributions per sector in 2018. Ideological/single issue, Health and Finance PACs contributed the most.
+
+```{r Plot 7: Number of PAC Contributions by Sector}
+ggplot(data=pacs_and_industries %>% filter(Cycle==2018) %>% 
+  group_by(Sector.Long) %>% 
+  summarise(number_pacs_contributions=n() ))+
+  
+  geom_bar(aes(x=Sector.Long,y=number_pacs_contributions) ,stat = "identity"    ) + 
+  coord_flip() + xlab("Sector")+ ylab("Number of PACs contributions") + ggtitle("Number of PACs contributions per sector in 2018")
+```
+
+
+The eigth plot gives the total amount of PAC contributions per sector in 2018. We have the same distribution of PACs as before.
+
+```{r Plot 8: Total PAC Contribution by Sector}
+ggplot(data=pacs_and_industries %>% filter(Cycle==2018) %>% 
+  group_by(Sector.Long) %>% 
+  summarise(amount_contributions=sum(Amount) ))+
+  
+  geom_bar(aes(x=Sector.Long,y=amount_contributions/(1000)) ,stat = "identity"    ) + 
+  
+  coord_flip() + xlab("Sector")+ ylab("Amount (in 1000$)")+ ggtitle("Total amount of PACs contributions per sector")
+
+```
+
+
+
+The ninth plot gives the average amount of PAC contributions per sector in 2018. The amounts are all approximately similar. Joint Candidate committees may be negative because of reimbursements.
+
+```{r Plot 9: Average PAC Contribution by Sector}
+ggplot(data=pacs_and_industries %>% filter(Cycle==2018) %>% 
+  group_by(Sector.Long) %>% 
+  summarise(amount_contributions=sum(Amount),
+            number_pacs_contributions=n(),
+            amount_per_contribution=amount_contributions/number_pacs_contributions ))+
+  
+  geom_bar(aes(x=Sector.Long,y=amount_per_contribution) ,stat = "identity"    ) + 
+  
+  coord_flip() + xlab("Sector")+ ylab("Amount")+ ggtitle("Average amount of PACs contributions per sector")
+```
+
+
+The tenth plot shows the distribution of Defense PAC contributions according to the type of candidates(Challenger,Incumbent and Open seat candidates).
+There are a few small contributions given to challenger candidates, and one third of the very small contributions are given to open seats. But the vast majority are given to incumbents, who are probably considered a safer bet.
+
+
+```{r Plot 10: Distribution of Defense PAC Contributions,message=FALSE}
+ggplot(df %>% filter(Amount_Defense_2018>0),aes(x=Amount_Defense_2018 ,
+                       fill=as.factor(CRPICO))) +
+  geom_histogram() +
+ xlab("Amount of contributions")+ 
+  ylab("Count of values")  + ggtitle("Distribution of Defense PAC contributions according to types of candidates")+
+  scale_fill_discrete (name='Status of the candidate', labels=c('Challenger','Incumbent',"Open seat"))
+```
+
+
+The eleventh plot shows the distribution of Single-Issue PAC contributions according to the type of candidates(Challenger,Incumbent and Open seat candidates).
+This time, there are a lot of small contributions given to challengers and open seats. Even with bigger amounts, there is still a solid kernel of contributions for these type of candidates.
+
+```{r Plot 11: Distribution of Single-Issue PAC Contributions,message=FALSE}
+ggplot(df %>% filter(Amount_Ideological_Single_Issue_2018>0),aes(x=Amount_Ideological_Single_Issue_2018 ,
+                       fill=as.factor(CRPICO))) +
+  geom_histogram() +
+  xlab("Amount of contributions")+ 
+  ylab("Count of values")  + ggtitle("Distribution of Single-issue PAC contributions according to types of candidates")+
+  scale_fill_discrete (name='Status of the candidate', labels=c('Challenger','Incumbent',"Open seat"))
+
+```
+
+
+## Model Training & Validation
+
+```{r}
+df <- read.csv("data.csv",header=T)
+```
+
+The following variables are present in the dataframe that we used to construct our models:  
+__- Party__: The party of the candidate. [Categorical: D, R, I, L, 3, U]  
+__- CurrCand__: Indicates whether the candidate is currently running for federal office. If a candidate loses a primary or drops out of the race, this field becomes blank. [Binary]  
+__- CycleCand__: Indicates whether the candidate ever ran for federal office during the cycle in question. Any candidate who filed to run for office or otherwise formally declared intention to run. This does NOT change if the candidate drops out or loses a primary. [Binary]  
+__- CRPICO__: Identifies the type of candidate. [Categorical: I, C, O]  
+__- NoPacs__: Identifies whether candidate has publicly committed to forego
+contributions from PACs. [Binary]  
+__- Amount_2014__: Total amount of contributions from PACs toward each candidate
+for the 2014 cycle. [Numeric]  
+__- Amount_2016__: Total amount of contributions from PACs toward each candidate
+for the 2016 cycle. [Numeric]  
+__- Amount_2018__: Total amount of contributions from PACs toward each candidate
+for the 2018 cycle. [Numeric]  
+__- Amount_Sector_2018__: Total amount of contributions from PACs of a given sector toward each candidate for 2018 cycle. [Numeric]  
+__- Three_M_Cont_2018__: Total amount of contributions from PACs toward each candidate for 2018 cycle, during the three months preceding the election. [Numeric]  
+__- Six_M_Cont_2018__: Total amount of contributions from PACs toward each candidate for 2018 cycle, during the six months preceding the election. [Numeric]  
+__- Twelve_M_Cont_2018__: Total amount of contributions from PACs toward each candidate for 2018 cycle, during the 12 months preceding the election. [Numeric]  
+__- N_candidates_final__: Number of candidates on the ballot on the election day of the 2018 cycle. [Numeric]  
+
+First, we decided to perform a penalized logistic regression through LASSO (Least Absolute Shrinkage and Selection Operator). We did a stratified split of the candidates into training (70%) and testing (30%) set based on the outcome variable.
+
+We used cv.glmnet for cross-validation to select best lambda. In particular, we did a 10-fold cross validation, selected for the best Area Under the ROC Curve (AUC), and picked lambda.min, which gives the minimum mean cross-validated error. We then obtained estimates of each coefficient, determined the in-sample threshold, accuracy, prediction and recall, and used this threshold to generate our out-of-sample prediction and test results.
+
+```{r}
+set.seed(123)
+df_split <- sample.split(df$Outcome,SplitRatio=0.7)
+train <- df[df_split==T,]
+test <- df[df_split==F,]
+```
+
+### Model 1
+
+For our first model, we used the party, status, and amount of PAC contributions received by the candidate from 2014, 2016, and 2018 as the independent variables. Model 1 has an out-of-sample AUC of 0.9768.
+
+```{r Model 1,message=FALSE}
+set.seed(123)
+
+X_train <- sparse.model.matrix(~0+factor(Party)+Amount_2014+Amount_2016+Amount_2018+factor(CRPICO)
+                               ,data=train)
+y_train <- train$Outcome
+
+X_test <- sparse.model.matrix(~0+factor(Party)+Amount_2014+Amount_2016+Amount_2018+factor(CRPICO)
+                              ,data=test)
+y_test <- test$Outcome
+
+cv_lasso <- cv.glmnet(X_train, y_train, family = "binomial",
+                      alpha = 1, nfolds = 10, type.measure = "auc")
+
+model <- glmnet(X_train,y_train,alpha=1,family="binomial",lambda=cv_lasso$lambda.min)
+
+coefs <- data.frame(variable=rownames(coef(model)),estimate=(coef(model)[,1]))
+rownames(coefs) <- 1:nrow(coefs)
+subset(coefs,estimate!=0)
+
+yhat_lasso_train <- predict(model,newx=X_train,type="response")
+roc <- roc(response=y_train,predictor=as.numeric(yhat_lasso_train))
+coords(roc,"best",transpose=T,ret=c("threshold","accuracy","precision","recall"))
+```
+
+```{r}
+yhat_lasso_test <- predict(model,newx=X_test,type="response")
+prop.table(table(as.numeric(yhat_lasso_test>=0.1193021),y_test))
+
+rocr.pred <- prediction(yhat_lasso_test,y_test)
+rocr.pred.1 <- data.frame(fpr=slot(performance(rocr.pred, "tpr", "fpr"),"x.values")[[1]],
+tpr=slot(performance(rocr.pred, "tpr", "fpr"),"y.values")[[1]])
+
+ggplot() +
+  geom_line(data=rocr.pred.1,aes(x=fpr,y=tpr),lwd=1) +
+  xlab("False Positive Rate") +
+  ylab("True Positive Rate") +
+  theme_bw() +
+  scale_color_manual(values = c('black')) +
+  theme(axis.title=element_text(size=18), axis.text=element_text(size=18))
+
+auc <- performance(rocr.pred, "auc")@y.values[[1]]
+print(auc)
+```
+
+### Model 2
+
+For our second model, we only used the party and status of the candidate as the independent variables. Model 2 has an out-of-sample AUC of 0.9543.
+
+```{r Model 2,message=FALSE}
+set.seed(123)
+
+X_train <- sparse.model.matrix(~0+factor(Party)+factor(CRPICO),data=train)
+y_train <- train$Outcome
+
+X_test <- sparse.model.matrix(~0+factor(Party)+factor(CRPICO),data=test)
+y_test <- test$Outcome
+
+cv_lasso <- cv.glmnet(X_train, y_train, family = "binomial",
+                      alpha = 1, nfolds = 10, type.measure = "auc")
+
+model <- glmnet(X_train,y_train,alpha=1,family="binomial",lambda=cv_lasso$lambda.min)
+
+coefs <- data.frame(variable=rownames(coef(model)),estimate=(coef(model)[,1]))
+rownames(coefs) <- 1:nrow(coefs)
+subset(coefs,estimate!=0)
+
+yhat_lasso_train <- predict(model,newx=X_train,type="response")
+roc <- roc(response=y_train,predictor=as.numeric(yhat_lasso_train))
+coords(roc,"best",transpose=T,ret=c("threshold","accuracy","precision","recall"))
+```
+
+```{r}
+yhat_lasso_test <- predict(model,newx=X_test,type="response")
+prop.table(table(as.numeric(yhat_lasso_test>=0.3857497),y_test))
+rocr.pred <- prediction(yhat_lasso_test,y_test)
+rocr.pred.2 <- data.frame(fpr=slot(performance(rocr.pred, "tpr", "fpr"),"x.values")[[1]],
+tpr=slot(performance(rocr.pred, "tpr", "fpr"),"y.values")[[1]])
+
+ggplot() +
+  geom_line(data=rocr.pred.2,aes(x=fpr,y=tpr),lwd=1) +
+  xlab("False Positive Rate") +
+  ylab("True Positive Rate") +
+  theme_bw() +
+  scale_color_manual(values = c('black')) +
+  theme(axis.title=element_text(size=18), axis.text=element_text(size=18))
+
+auc <- performance(rocr.pred, "auc")@y.values[[1]]
+print(auc)
+```
+
+```{r Comparison}
+#Baseline
+baseline <- data.frame(x=c(0,1),y=c(0,1))
+#Ideal
+ideal <- data.frame(x=c(0,0,1),y=c(0,1,1))
+
+ggplot() +
+  geom_line(data=rocr.pred.1,aes(x=fpr,y=tpr,colour='1'),lwd=1) +
+  geom_line(data=rocr.pred.2,aes(x=fpr,y=tpr,colour='2'),lwd=1) +
+  geom_line(data=baseline, aes(x=x, y=y,colour='3'),lwd=1) +
+  geom_line(data=ideal, aes(x=x, y=y,colour='4'),lwd=1) +
+  xlab("False Positive Rate") +
+  ylab("True Positive Rate") +
+  theme_bw() +
+  scale_color_manual(values = c('black','red','blue','green'), name = "",
+  labels = c("Model 1","Model 2","Baseline","Ideal")) +
+  theme(axis.title=element_text(size=18), axis.text=element_text(size=18),
+  legend.text=element_text(size=18))
+```
+
+Comparing the two models using the Receiver Operating Characteristic (ROC) curve, we can see that Model 1 does perform better than Model 2, since it has a larger AUC. Therefore, PAC contributions do serve as an indicator of the election outcome. However, it seemed as though the CRPICO variable, which indicates the status of the candidate, also played a large role in determining the outcome. Thus, we further constructed a third model to investigate exclusively the role of the amount of contributions from PACs to the candidate.
+
+
+### Model 3
+
+
+We only used monetary contributions as variables. We did not use the variable (Amount_2018 (all contributions during election cycle 2018)), and stopped at one year before the election.
+
+Here are the variables we used:
+
+```{r Variables used}
+num_variables <- colnames(df)[c(13:14,16:36)]
+num_variables
+```
+
+
+```{r,message=FALSE}
+formula <- paste(num_variables,collapse="+ ")
+formula_money <- as.formula(paste("Outcome~",formula,collapse=""))
+
+
+X_train <- sparse.model.matrix(formula_money,data=train)
+y_train <- train$Outcome
+
+X_test <- sparse.model.matrix(formula_money,data=test)
+y_test <- test$Outcome
+
+cv_lasso <- cv.glmnet(X_train, y_train, family = "binomial",
+                      alpha = 1, nfolds = 10, type.measure = "auc")
+
+model <- glmnet(X_train,y_train,alpha=1,family="binomial",lambda=cv_lasso$lambda.min)
+
+coefs <- data.frame(variable=rownames(coef(model)),estimate=(coef(model)[,1]))
+rownames(coefs) <- 1:nrow(coefs)
+subset(coefs,estimate!=0)
+
+yhat_lasso_train <- predict(model,newx=X_train,type="response")
+roc <- roc(response=y_train,predictor=as.numeric(yhat_lasso_train))
+coords(roc,"best",transpose=T,ret=c("threshold","accuracy","precision","recall"))
+```
+
+The model only selected 9 variables. The coefficients are very small because an increase of $1 in contributions doesn't change the probabilities of winning: they need to be range of thousands of dollars.
+
+The raw amount of money received in the previous 3 or 6 months is a good indicator of election. Also, some industries such as Defense, Agribusiness are also correlated with high chances of election.
+
+We have an AUC of 0.9759.
+
+```{r}
+yhat_lasso_test <- predict(model,newx=X_test,type="response")
+prop.table(table(as.numeric(yhat_lasso_test>=0.0803195),y_test))
+rocr.pred <- prediction(yhat_lasso_test,y_test)
+rocr.pred.2 <- data.frame(fpr=slot(performance(rocr.pred, "tpr", "fpr"),"x.values")[[1]],
+tpr=slot(performance(rocr.pred, "tpr", "fpr"),"y.values")[[1]])
+
+ggplot() +
+  geom_line(data=rocr.pred.2,aes(x=fpr,y=tpr),lwd=1) +
+  xlab("False Positive Rate") +
+  ylab("True Positive Rate") +
+  theme_bw() +
+  scale_color_manual(values = c('black')) +
+  theme(axis.title=element_text(size=18), axis.text=element_text(size=18))
+
+auc <- performance(rocr.pred, "auc")@y.values[[1]]
+print(auc)
+```
+
+
+
+
+## Results & Extensions
+
+On a surface level, we found that PAC contribution can be a good indicator of electoral success. For instance, according to Model 3, a contribution increase of $45000 from Defense PAC contributions doubles the odds of winning. 
+However, we have also found that incumbents have a very high probability of reelection. Even more, as evidenced by Model 2, this variable is almost enough to predict the probability of election of a candidate. Obviously, there are several factors at work behind the incumbency advantage. 
+Also, incumbents also tend to get more contributions from PACs. The causal relationship here is unclear - we do not know whether the best candidates raise more money, or if raising more money contributed to their electoral victory.
+
+
+In particular, the strong apparent relationship between incumbency and amount raised led us to:
+
+__-__: predict incumbency from the PACs contributions (and confirm the hints given by our models and the EDA)
+__-__: use causal inference (matching) to determine the effect of incumbency over election results, independently (as much as possible) of contributions.
+
+
+### Predicting Incumbency from contributions
+
+We first endeavoured to predict the CRPICO variable (Challenger, Incumbent, Open Seat) from
+the amount of contributions (per industry and timeframe).
+
+Instead of logistic regression, we decided to use classification trees. They have several advantages:
+
+- they mimick human decision-making
+- they select the most relevant variables for us
+- they can deliver nonlinear predictions that are hard to capture with logistic regression
+
+
+We trained our tree on a training dataset, and determined both in-sample/out-of sample accuracy and confusion matrixes.
+
+
+
+```{r Tree}
+set.seed(02138)
+df_split <- sample.split(df$CRPICO,SplitRatio=0.7)
+train <- df[df_split==T,]
+test <- df[df_split==F,]
+
+
+formula_status_money <- as.formula(paste("CRPICO~",formula,collapse=""))
+tree1 <- rpart(formula_status_money,
+data = train , method="class",
+minbucket=5, cp=0.004)
+
+prp(tree1,digits = 3,varlen=0,faclen=0)
+```
+
+To interpret the trees, we take a given candidate for which we know the different amounts of contributions. Given these different values, we "follow" the splits made by the tree until the final node, which outputs the type of the candidate. 
+For each split, we go to the left when the candidate verifies the assertion at the split, and right in the other case. 
+
+The first variables are often the most important. Here, a high amount (more than $35 700) of money raised in __2016__ immediately gives out that the candidate is an incumbent in 2018.
+Also, if a candidate did not raise this amount in 2016 but has received significant contributions from two industries (Finance/Insurance/Real Estate and Electronics), our model predicts him to be an incumbent.
+
+
+```{r}
+pred_train <- predict(tree1,newdata= train,type="class")
+
+confusion <- table(train$CRPICO, pred_train)
+confusion
+```
+
+```{r}
+accuracy <- (confusion[1,1]+confusion[2,2]+confusion[3,3])/sum(confusion)
+print("Accuracy on train")
+print(accuracy)
+print("Percentage of Open seats candidates predicted as Challenger")
+print(confusion[3,1]/sum(confusion[3,])    )
+```
+
+
+
+```{r}
+pred_test <- predict(tree1,newdata= test,type="class")
+
+confusion <- table(test$CRPICO, pred_test)
+confusion
+```
+
+```{r}
+accuracy <- (confusion[1,1]+confusion[2,2]+confusion[3,3])/sum(confusion)
+print("Accuracy on test")
+print(accuracy)
+print("Percentage of Open seats candidates predicted as Challenger")
+print(confusion[3,1]/sum(confusion[3,])    )
+```
+
+On both sets, the accuracy is not bad (0.76 on train and 0.71 on test). Challengers and Incumbents candidates are almost all well predicted. 
+However, most of the open seats candidates are predicted to be challengers. Our model seems to have trouble differentiating them. 
+As a sidenote, more complex splits in the tree (those deeper) were indeed splits between C and O.
+
+
+### Matching: Effect of Incumbency on Election Results
+
+
+One major issue we have had in predicting election results lies in the fact that many of the covariates are highly correlated. In particular, incumbents tend to receive more contributions, and similar industries contribute to the same types of candidates.
+In order to alleviate this kind of problem, we tried to use a causal inference technique called matching. 
+
+We removed the open seats districts and divided the candidates between incumbents (I) and non incumbents. The idea is to pair each incumbent with a similar (in terms of covariates) non incumbent. We end up with two groups of candidates as close as possible, which only differ by the "treatment"(incumbency). If our matching is good and the groups are similar enough, we would be able to directly measure the effect of incumbency over election outcomes.
+
+The covariates we used are all the features corresponding to contributions:
+
+```{r}
+num_variables
+```
+
+
+The variable used to measure the similarity is the absolute standardized mean difference. It is defined for each covariate.
+If $A$ is an amount,
+
+$$
+SMD(A)= \frac{|Mean_{I}(A) -Mean_{Non-I}(A)|}{Standard~deviation~of~A~between~the~two~groups}
+$$
+
+
+We then plot the SMD for each covariate, between the groups of incumbents and non-incumbents.
+
+```{r,warning=FALSE}
+df_matching <- df %>% filter(CRPICO !='O')
+df_matching$incumb<- df_matching$CRPICO=="I"
+bl_c_i <- bal.tab(df_matching[num_variables], treat = df_matching$incumb, estimand="ATT", continuous="std")
+love.plot(x = bl_c_i, stat = "mean.diffs", abs = TRUE, var.order = "unadjusted", threshold = 0.1)
+```
+
+As we can notice, the SMD is high for most of the covariates. The dashed line (for SMD=0.1) corresponds to the usual threshold above which the two groups are considered too dissimilar. Only 3 variables have a SMD close to 0.1, and most are close to 1.5.
+
+
+We then matched the elements of the two groups. As we have less incumbents (413) than non-incumbents (1564), we are going to select only 414 non incumbents.
+
+```{r,warning=FALSE}
+match_c_i <- Match(Tr=df_matching$incumb, M=1, X=df_matching[num_variables])
+
+matched_c_i<- df_matching[unlist(match_c_i[c("index.treated","index.control")]), ]
+
+
+#m_tab_c_i <- CreateTableOne(vars=num_variables, strat="incumb", data=matched_c_i, test=FALSE)
+#print(m_tab_c_i,smd=TRUE)
+
+matched_c_i$incumb<- as.numeric(matched_c_i$incumb)
+
+balance_c_i <- bal.tab(matched_c_i[num_variables], treat = matched_c_i$incumb, estimand="ATT", continuous="std")
+love.plot(x = balance_c_i, stat = "mean.diffs", abs = TRUE, var.order = "unadjusted", threshold = 0.1)
+```
+
+After matching, most of the covariates have lower SMD. In particular, the maximum SMD is now 1, with 2/3 of the variables having 0.5 or less SMD.
+The matching has been useful to reduce the differences among the two groups. However, for causal inference purpose, they are still quite dissimilar and we need to exercise caution with our results.
+
+We finally compute the average treatment effect (ATE) of incumbency.
+
+```{r ATE}
+mean(df_matching$Outcome[df_matching$incumb==TRUE])-mean(df_matching$Outcome[df_matching$incumb==FALSE])
+```
+
+This ATE is very high and seems to indicate that incumbency in itself is extremely valuable for re election.
+
+
+Our future steps involve examining more data from previous election cycles. Since congressional elections take place every 2 years, and all 435 Representatives serve 2-year terms, data is more frequent and comprehensive. On the other hand, only 35 seats in the Senate were up for election in 2018, and Senators serve 6-year terms, so our model was unable to capture all Senators. We can also use more efficient causal inference techniques to understand the role of incumbency and monetary contributions.
